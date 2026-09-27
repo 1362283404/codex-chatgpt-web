@@ -260,6 +260,7 @@ export class TurnBroker implements TurnBrokerOwner {
   private acceptingExternalOwners = true;
   private server?: Server;
   private startPromise?: Promise<void>;
+  private socketIdentity?: { dev: number; ino: number };
 
   private constructor(readonly socketPath: string) {}
 
@@ -739,16 +740,21 @@ export class TurnBroker implements TurnBrokerOwner {
     const server = this.server;
     this.server = undefined;
     this.startPromise = undefined;
-    brokers.delete(this.socketPath);
+    if (brokers.get(this.socketPath) === this) brokers.delete(this.socketPath);
     if (server?.listening) {
       await new Promise<void>((resolveClose, rejectClose) => server.close(error => {
         if (!error || (error as NodeJS.ErrnoException).code === "ERR_SERVER_NOT_RUNNING") resolveClose();
         else rejectClose(error);
       }));
     }
-    if (!isWindowsPipeEndpoint(this.socketPath)
-      && existsSync(this.socketPath)
-      && lstatSync(this.socketPath).isSocket()) unlinkSync(this.socketPath);
+    const identity = this.socketIdentity;
+    this.socketIdentity = undefined;
+    if (identity && existsSync(this.socketPath)) {
+      const current = lstatSync(this.socketPath);
+      if (current.isSocket() && current.dev === identity.dev && current.ino === identity.ino) {
+        unlinkSync(this.socketPath);
+      }
+    }
   }
 
   private start(): Promise<void> {
@@ -780,7 +786,11 @@ export class TurnBroker implements TurnBrokerOwner {
         });
         server.listen(this.socketPath, () => {
           server.off("error", rejectStart);
-          if (!windowsPipe) chmodSync(this.socketPath, 0o600);
+          if (!windowsPipe) {
+            const { dev, ino } = lstatSync(this.socketPath);
+            this.socketIdentity = { dev, ino };
+            chmodSync(this.socketPath, 0o600);
+          }
           resolveStart();
         });
       };
@@ -1231,7 +1241,6 @@ export async function callTurnBroker<T>(
   signal?: AbortSignal,
 ): Promise<T> {
   const id = opaqueId("request");
-  const settleOnResponseFrame = timeoutMs === null;
   // The wire protocol requires a client-owned activity identity. Most callers never need to see
   // it; the MCP server supplies its own so it can retire an ambiguously delivered claim, while
   // lower-level diagnostics receive an equally client-generated identity here.
@@ -1275,8 +1284,7 @@ export async function callTurnBroker<T>(
     }
     socket.setEncoding("utf8");
     socket.once("error", error => finishError(new Error(`ChatGPT web turn broker unavailable: ${error.message}`)));
-    // The server owns response termination. Waiting for the pipe/socket to close before resolving
-    // prevents callers from retiring the broker while Bun still has a named-pipe write in flight.
+    // A peer that closes before delivering a full response has not completed the call.
     socket.once("close", finishResponse);
     socket.once("connect", () => socket.write(`${JSON.stringify({ id, ...wireRequest })}\n`));
     socket.on("data", chunk => {
@@ -1295,17 +1303,26 @@ export async function callTurnBroker<T>(
         finishError(new Error(`ChatGPT web turn broker returned invalid JSON: ${errorOf(error).message}`));
         return;
       }
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)
+        || ("result" in parsed) === ("error" in parsed)
+        || ("error" in parsed && (typeof parsed.error !== "string" || !parsed.error))) {
+        finishError(new Error("ChatGPT web turn broker returned an invalid response frame"));
+        return;
+      }
       if (parsed.id !== id) {
         finishError(new Error("ChatGPT web turn broker response id mismatch"));
         return;
       }
       response = parsed;
-      if (settleOnResponseFrame) {
-        // A long-poll keeps its request half open while the server waits. Its complete response
-        // frame is therefore the terminal boundary; ordinary calls still wait for physical close.
-        finishResponse();
-        socket.destroy();
-      }
+      finishResponse();
+      // Delivery is complete; a delayed peer close cannot turn it into a timeout.
+      // Send a graceful EOF rather than destroying a pipe while the peer drains its
+      // write. Bound only resource cleanup if that peer never finishes closing.
+      const closeTimer = setTimeout(() => socket.destroy(), 5_000);
+      closeTimer.unref?.();
+      socket.once("close", () => clearTimeout(closeTimer));
+      socket.end();
+      socket.unref();
     });
   });
 }
