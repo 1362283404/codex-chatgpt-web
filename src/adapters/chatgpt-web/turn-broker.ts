@@ -1241,6 +1241,7 @@ export async function callTurnBroker<T>(
   signal?: AbortSignal,
 ): Promise<T> {
   const id = opaqueId("request");
+  const settleOnResponseFrame = timeoutMs === null;
   // The wire protocol requires a client-owned activity identity. Most callers never need to see
   // it; the MCP server supplies its own so it can retire an ambiguously delivered claim, while
   // lower-level diagnostics receive an equally client-generated identity here.
@@ -1284,7 +1285,8 @@ export async function callTurnBroker<T>(
     }
     socket.setEncoding("utf8");
     socket.once("error", error => finishError(new Error(`ChatGPT web turn broker unavailable: ${error.message}`)));
-    // A peer that closes before delivering a full response has not completed the call.
+    // The server owns response termination. Bounded calls wait for the pipe/socket to close
+    // before their callers can advance the lifecycle while Bun drains named-pipe writes.
     socket.once("close", finishResponse);
     socket.once("connect", () => socket.write(`${JSON.stringify({ id, ...wireRequest })}\n`));
     socket.on("data", chunk => {
@@ -1314,15 +1316,11 @@ export async function callTurnBroker<T>(
         return;
       }
       response = parsed;
-      finishResponse();
-      // Delivery is complete; a delayed peer close cannot turn it into a timeout.
-      // Send a graceful EOF rather than destroying a pipe while the peer drains its
-      // write. Bound only resource cleanup if that peer never finishes closing.
-      const closeTimer = setTimeout(() => socket.destroy(), 5_000);
-      closeTimer.unref?.();
-      socket.once("close", () => clearTimeout(closeTimer));
-      socket.end();
-      socket.unref();
+      if (settleOnResponseFrame) {
+        // Long-polls finish on the full frame; their peer can otherwise keep both halves open.
+        finishResponse();
+        socket.destroy();
+      }
     });
   });
 }

@@ -325,26 +325,35 @@ test("an unbounded broker call fails when the broker closes without answering", 
   }
 }, 10_000);
 
-test("a complete broker frame settles before peer close and finishes with a graceful EOF", async () => {
-  let sawEof = false;
-  let finishEof!: () => void;
-  const eof = new Promise<void>(resolve => { finishEof = resolve; });
+test("bounded broker calls preserve server-owned closure before advancing the lifecycle", async () => {
+  let peer!: Socket;
+  let finishFrame!: () => void;
+  const frameWritten = new Promise<void>(resolve => { finishFrame = resolve; });
   const broker = unansweredBrokerEndpoint("cgw-broker-frame-", socket => {
-    socket.once("end", () => { sawEof = true; finishEof(); });
+    peer = socket;
     socket.once("data", chunk => {
       const request = JSON.parse(chunk.toString().trim());
       const frame = JSON.stringify({ id: request.id, result: { ready: true } }) + "\n";
       socket.write(frame.slice(0, -1));
-      setImmediate(() => socket.write(frame.slice(-1)));
-      // Leave the peer open: response delivery must not depend on its close event.
+      setImmediate(() => { socket.write(frame.slice(-1)); finishFrame(); });
     });
   });
   await broker.listen();
   try {
-    await expect(callTurnBroker(broker.socketPath, { method: "owner_status" }, 500)).resolves.toEqual({ ready: true });
-    await eof;
-    expect(sawEof).toBeTrue();
-  } finally { await broker.close(); }
+    let settled = false;
+    const call = callTurnBroker(broker.socketPath, { method: "owner_status" }).then(result => {
+      settled = true;
+      return result;
+    });
+    await frameWritten;
+    await Bun.sleep(25);
+    expect(settled).toBeFalse();
+    peer.end();
+    await expect(call).resolves.toEqual({ ready: true });
+  } finally {
+    peer?.destroy();
+    await broker.close();
+  }
 });
 
 test("broker frame settlement still rejects errors, wrong identities and incomplete replies", async () => {
