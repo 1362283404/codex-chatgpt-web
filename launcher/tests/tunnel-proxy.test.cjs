@@ -21,23 +21,23 @@ test("uses exactly the first PAC route and rejects unusable routes without going
     error.message.startsWith("Tunnel proxy:") && !error.message.includes("secret"));
 });
 
-test("system lookup targets the configured control plane and preserves bypasses without mutating parent env", async () => {
+for (const platform of ["linux", "darwin", "win32"]) test(`system lookup preserves the target and bypasses without mutating parent env on ${platform}`, async () => {
   const env = { CONTROL_PLANE_BASE_URL: "https://gateway.example", no_proxy: "intranet.example", KEEP: "value" };
   const calls = [];
-  const result = await tunnelConnectionEnvironment({ env, resolveProxy: async url => {
+  const result = await tunnelConnectionEnvironment({ env, platform, resolveProxy: async url => {
     calls.push(url);
     return "PROXY proxy.example:8080; DIRECT";
   } });
   assert.deepEqual(calls, ["https://gateway.example/"]);
   assert.equal(result.baseURL, "https://gateway.example");
   assert.equal(result.env.HTTPS_PROXY, "http://proxy.example:8080/");
-  assert.equal(result.env.no_proxy, "intranet.example");
-  assert.equal(result.env.NO_PROXY, undefined);
+  assert.equal(result.env[platform === "win32" ? "NO_PROXY" : "no_proxy"], "intranet.example");
+  assert.equal(result.env[platform === "win32" ? "no_proxy" : "NO_PROXY"], undefined);
   assert.equal(result.env.KEEP, "value");
-  assert.equal(env.HTTPS_PROXY, undefined);
-  const direct = await tunnelConnectionEnvironment({ env: {}, resolveProxy: async () => "DIRECT" });
+  assert.deepEqual(env, { CONTROL_PLANE_BASE_URL: "https://gateway.example", no_proxy: "intranet.example", KEEP: "value" });
+  const direct = await tunnelConnectionEnvironment({ env: {}, platform, resolveProxy: async () => "DIRECT" });
   assert.deepEqual(direct.env, {});
-  const proxy = await tunnelConnectionEnvironment({ env: {}, resolveProxy: async () => "SOCKS5 localhost:1080" });
+  const proxy = await tunnelConnectionEnvironment({ env: {}, platform, resolveProxy: async () => "SOCKS5 localhost:1080" });
   assert.equal(proxy.env.NO_PROXY, "localhost,127.0.0.1,::1");
 });
 
