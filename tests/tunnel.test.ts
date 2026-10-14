@@ -155,7 +155,9 @@ test("pins the fixed tunnel-client and migrates only previously shipped versions
 });
 
 test("upgrades 0.0.12 with verified assets and restores it if manifest installation fails", async () => {
-  for (const failManifest of [false, true]) await withTunnelInstall("darwin", async fixture => {
+  // Windows files do not expose Unix execute bits, so keep the filesystem checks native.
+  const platform = process.platform === "win32" ? "win32" : "darwin";
+  for (const failManifest of [false, true]) await withTunnelInstall(platform, async fixture => {
     const manifest = join(fixture.root, "bin", "tunnel-client-manifest.json");
     const oldBinary = "trusted 0.0.12 binary";
     const oldManifest = JSON.stringify({ version: 1, tunnelClientVersion: "0.0.12",
