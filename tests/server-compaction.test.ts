@@ -330,25 +330,35 @@ for (const format of ["v1", "v2"] as const) test(`${format} native continuation 
   expect(starts).toBe(2);
 });
 
-test("v1 goal compaction authorizes the human instruction that native Codex retains", async () => {
+for (const format of ["v1", "v2"] as const) test(`${format} goal compaction authorizes the human instruction past a standalone AGENTS preamble`, async () => {
   const config = defaultConfig("full");
-  const metadata = { thread_id: "thread_goal_compaction", turn_id: "turn_goal_continuation" };
+  const metadata = { thread_id: `thread_goal_compaction_${format}`, turn_id: "turn_goal_continuation" };
   const source = { type: "message", role: "user", id: "msg_human",
     content: [{ type: "input_text", text: "Finish the requested work" }],
     internal_chat_message_metadata_passthrough: { turn_id: "turn_human", content_item_kinds: ["user.text"] } };
   const goal = { type: "message", role: "user", id: "msg_goal_context",
     content: [{ type: "input_text", text: '<codex_internal_context source="goal">\nContinue the active goal.\n</codex_internal_context>' }],
     internal_chat_message_metadata_passthrough: { turn_id: metadata.turn_id, content_item_kinds: ["goal.internal_context"] } };
-  const original = { model, stream: false, input: [source, goal],
+  // Instruction refreshes can be standalone user-role context, without an environment tag.
+  // Native compaction drops these and rebuilds the preamble before the last real user.
+  const instructions = { type: "message", role: "user", id: "msg_agents_refresh",
+    content: [{ type: "input_text", text: "# AGENTS.md instructions\n<INSTRUCTIONS>Use the repository rules.</INSTRUCTIONS>" }],
+    internal_chat_message_metadata_passthrough: { turn_id: "turn_previous_goal", content_item_kinds: ["agents_md.instructions"] } };
+  const original = { model, stream: false, input: [source, instructions, goal],
     client_metadata: { "x-codex-turn-metadata": JSON.stringify(metadata) } };
-  const compact = await compactRequest(new Request("http://127.0.0.1/v1/responses/compact", {
-    method: "POST", body: JSON.stringify(original),
-  }), config, compactionAdapterFactory());
+  const compact = format === "v1"
+    ? await compactRequest(new Request("http://127.0.0.1/v1/responses/compact", {
+      method: "POST", body: JSON.stringify(original),
+    }), config, compactionAdapterFactory())
+    : await responseRequest(new Request("http://127.0.0.1/v1/responses", {
+      method: "POST", body: JSON.stringify({ ...original, input: [...original.input, { type: "compaction_trigger" }] }),
+    }), config, compactionAdapterFactory());
   expect(compact.status).toBe(200);
   const compacted = await compact.json() as { output: Array<{ id?: string }> };
   // Codex 0.152.1 process_annotated_compacted_history drops internal model context.
   // The fixture preserves the wire behavior even if our v1 producer accidentally returns it.
-  const installed = compacted.output.filter(item => item.id !== goal.id);
+  const retained = compacted.output.filter(item => item.id !== goal.id && item.id !== instructions.id);
+  const installed = format === "v1" ? retained : [source, ...retained];
   const response = await responseRequest(new Request("http://127.0.0.1/v1/responses", {
     method: "POST", body: JSON.stringify({ ...original, input: installed }),
   }), config, () => ({ name: "native-goal-continuation", async runTurn(parsed, _incoming, emit) {
@@ -359,6 +369,7 @@ test("v1 goal compaction authorizes the human instruction that native Codex reta
   expect(response.status).toBe(200);
   expect((await response.json() as { status: string }).status).toBe("completed");
   expect(compacted.output).not.toContainEqual(expect.objectContaining({ id: goal.id }));
+  expect(compacted.output).not.toContainEqual(expect.objectContaining({ id: instructions.id }));
 });
 
 test("v1 post-compaction continuation retains the producer's bounded source representation", async () => {
