@@ -37,12 +37,17 @@ export function rememberCompactionContinuation(
   const key = scope(parsed, identity);
   if (!key || !parsed._compactionRequest || !summary || !sources[0]) return;
   const input = (parsed._rawBody as { input?: Array<Record<string, unknown>> } | undefined)?.input;
+  const previous = recoverCompactionInstruction(parsed, identity);
   // Source extraction has already authenticated this synthetic native instruction. Unlike
   // human messages, function-call outputs are not retained by the v1 compaction producer.
   const sourceWasDelegation = sources[0].itemId !== undefined && Array.isArray(input)
     && input.some(item => item?.id === sources[0]!.itemId && item.type === "function_call_output"
       && item.name === "send_message_to_thread" && item.namespace === "codex_app" && item.call_id === undefined
-      && item.output === sources[0]!.content);
+      && item.output === sources[0]!.content)
+    // Later compactions no longer contain the synthetic item. Carry its provenance only
+    // through an exact earlier completed checkpoint, never a newer steering instruction.
+    || previous?.sourceWasDelegation === true && previous.source.itemId === sources[0].itemId
+      && sourceDigest(previous.source) === sourceDigest(sources[0]);
   checkpoints.delete(key);
   checkpoints.set(key, {
     summaryHash: digest(summary), sourceHashes: new Set(sources.map(sourceDigest)),

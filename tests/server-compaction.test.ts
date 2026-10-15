@@ -310,10 +310,24 @@ for (const format of ["v1", "v2"] as const) test(`${format} native continuation 
   const continued = await send(installed);
   expect(continued.status).toBe(200);
   expect((await continued.json()).status).toBe("completed");
+  // A long-running delegated task can compact again after its synthetic source was dropped.
+  const recompact = format === "v1"
+    ? await compactRequest(new Request("http://127.0.0.1/v1/responses/compact", {
+      method: "POST", body: JSON.stringify({ ...original, input: installed }),
+    }), config, compactionAdapterFactory())
+    : await responseRequest(new Request("http://127.0.0.1/v1/responses", {
+      method: "POST", body: JSON.stringify({ ...original, input: [...installed, { type: "compaction_trigger" }] }),
+    }), config, compactionAdapterFactory());
+  expect(recompact.status).toBe(200);
+  const recompacted = await recompact.json() as { output: unknown[] };
+  const reinstalled = format === "v1" ? recompacted.output : [previous, aborted, ...recompacted.output];
+  const continuedAgain = await send(reinstalled);
+  expect(continuedAgain.status).toBe(200);
+  expect((await continuedAgain.json()).status).toBe("completed");
   // Recovery of a different task never revives an explicitly interrupted delegation.
-  expect((await send([...installed, { ...aborted, id: "msg_delegation_abort",
+  expect((await send([...reinstalled, { ...aborted, id: "msg_delegation_abort",
     internal_chat_message_metadata_passthrough: delegation.internal_chat_message_metadata_passthrough }])).status).toBe(400);
-  expect(starts).toBe(1);
+  expect(starts).toBe(2);
 });
 
 test("v1 goal compaction authorizes the human instruction that native Codex retains", async () => {

@@ -278,11 +278,11 @@ export function extractChatGptTurnUserRevision(parsed: CodexParsedRequest): unkn
   return revision.content;
 }
 
-function latestChatGptTurnUserRevision(parsed: CodexParsedRequest, expectedTurnId?: string): ChatGptTurnUserRevision | undefined {
+function latestChatGptTurnUserRevision(parsed: CodexParsedRequest, expectedTurnId?: string, recoverCheckpoint = true): ChatGptTurnUserRevision | undefined {
   const body = record(parsed._rawBody);
   const input = Array.isArray(body?.input) ? body.input : [];
   const metadata = clientTurnMetadata(parsed);
-  const recovered = recoverCompactionInstruction(parsed, extractChatGptTurnIdentity(parsed));
+  const recovered = recoverCheckpoint ? recoverCompactionInstruction(parsed, extractChatGptTurnIdentity(parsed)) : undefined;
   for (let index = input.length - 1; index >= 0; index -= 1) {
     const revision = userRevision(input[index], expectedTurnId, metadata);
     if (revision) {
@@ -331,9 +331,12 @@ export function chatGptTurnUserRevisionHistory(parsed: CodexParsedRequest): Chat
 }
 
 /** A remote compaction may summarize an instruction from an earlier turn. */
-export function extractChatGptCompactionSourceRevision(parsed: CodexParsedRequest): ChatGptTurnUserRevision {
+export function extractChatGptCompactionSourceRevision(
+  parsed: CodexParsedRequest,
+  options: { recoverCheckpoint?: boolean } = {},
+): ChatGptTurnUserRevision {
   if (!parsed._compactionRequest) throw new Error("ChatGPT web compaction source requires a compaction request");
-  const revision = latestChatGptTurnUserRevision(parsed, extractChatGptTurnIdentity(parsed).turnId);
+  const revision = latestChatGptTurnUserRevision(parsed, extractChatGptTurnIdentity(parsed).turnId, options.recoverCheckpoint !== false);
   if (!revision) throw new Error("ChatGPT web compaction requires a source user message");
   return revision;
 }
