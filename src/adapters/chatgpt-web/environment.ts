@@ -282,11 +282,19 @@ function latestChatGptTurnUserRevision(parsed: CodexParsedRequest, expectedTurnI
   const body = record(parsed._rawBody);
   const input = Array.isArray(body?.input) ? body.input : [];
   const metadata = clientTurnMetadata(parsed);
+  const recovered = recoverCompactionInstruction(parsed, extractChatGptTurnIdentity(parsed));
   for (let index = input.length - 1; index >= 0; index -= 1) {
     const revision = userRevision(input[index], expectedTurnId, metadata);
-    if (revision) return revision;
+    if (revision) {
+      // v1 retains the older human message but drops a synthetic delegation. Recover the
+      // actual task only for an exact producer-authenticated retained representation before
+      // our checkpoint. New steering and rewritten history keep their normal validation.
+      return recovered?.sourceWasDelegation && index < recovered.summaryIndex
+        && isAcceptedCompactionContinuation(parsed, extractChatGptTurnIdentity(parsed), revision)
+        ? recovered.source : revision;
+    }
   }
-  return recoverCompactionInstruction(parsed, extractChatGptTurnIdentity(parsed))?.source;
+  return recovered?.source;
 }
 
 function userRevision(value: unknown, expectedTurnId?: string, metadata?: Record<string, unknown>): ChatGptTurnUserRevision | undefined {
@@ -308,13 +316,18 @@ export function chatGptTurnUserRevisionHistory(parsed: CodexParsedRequest): Chat
   const body = record(parsed._rawBody);
   const turnId = extractChatGptTurnIdentity(parsed).turnId;
   const metadata = clientTurnMetadata(parsed);
-  const revisions = (Array.isArray(body?.input) ? body.input : []).flatMap(value => {
+  const recovered = recoverCompactionInstruction(parsed, extractChatGptTurnIdentity(parsed));
+  const input = Array.isArray(body?.input) ? body.input : [];
+  const prefix = recovered?.sourceWasDelegation ? input.slice(0, recovered.summaryIndex) : [];
+  const retained = prefix.map(value => userRevision(value, turnId, metadata)).filter(value => value !== undefined).at(-1);
+  const recoverDelegation = recovered?.sourceWasDelegation && (!retained
+    || isAcceptedCompactionContinuation(parsed, extractChatGptTurnIdentity(parsed), retained));
+  const revisions = input.slice(recoverDelegation ? recovered!.summaryIndex + 1 : 0).flatMap(value => {
     const revision = userRevision(value, turnId, metadata);
     return revision ? [revision] : [];
   });
-  if (revisions.length > 0) return revisions;
-  const recovered = recoverCompactionInstruction(parsed, extractChatGptTurnIdentity(parsed));
-  return recovered ? [recovered.source] : [];
+  if (recoverDelegation) return [recovered!.source, ...revisions];
+  return revisions.length > 0 ? revisions : recovered ? [recovered.source] : [];
 }
 
 /** A remote compaction may summarize an instruction from an earlier turn. */

@@ -275,6 +275,47 @@ for (const format of ["v1", "v2"] as const) test(`${format} pre-turn compaction 
   expect(starts).toBe(2);
 });
 
+for (const format of ["v1", "v2"] as const) test(`${format} native continuation preserves a dropped delegation past an interrupted human turn`, async () => {
+  const config = defaultConfig("full");
+  const metadata = { thread_id: `thread_dropped_delegation_${format}`, turn_id: "turn_after_delegation" };
+  const previous = { type: "message", role: "user", id: "msg_interrupted_human", content: [{ type: "input_text", text: "Earlier human task" }],
+    internal_chat_message_metadata_passthrough: { turn_id: "turn_interrupted_human" } };
+  const aborted = { type: "message", role: "user", id: "msg_human_abort",
+    content: "<turn_aborted>The user interrupted this turn.</turn_aborted>",
+    internal_chat_message_metadata_passthrough: previous.internal_chat_message_metadata_passthrough };
+  const delegation = { type: "function_call_output", id: "fco_delegated_task", name: "send_message_to_thread",
+    namespace: "codex_app", output: "<codex_delegation><source_thread_id>source_thread</source_thread_id><input>Finish the new delegated task.</input></codex_delegation>",
+    internal_chat_message_metadata_passthrough: { turn_id: "turn_delegated_task" } };
+  const original = { model, stream: false, input: [previous, aborted, delegation],
+    client_metadata: { "x-codex-turn-metadata": JSON.stringify(metadata) } };
+  const compact = format === "v1"
+    ? await compactRequest(new Request("http://127.0.0.1/v1/responses/compact", {
+      method: "POST", body: JSON.stringify(original),
+    }), config, compactionAdapterFactory())
+    : await responseRequest(new Request("http://127.0.0.1/v1/responses", {
+      method: "POST", body: JSON.stringify({ ...original, input: [...original.input, { type: "compaction_trigger" }] }),
+    }), config, compactionAdapterFactory());
+  expect(compact.status).toBe(200);
+  const compacted = await compact.json() as { output: unknown[] };
+  const installed = format === "v1" ? compacted.output : [previous, aborted, ...compacted.output];
+  let starts = 0;
+  const send = (input: unknown[]) => responseRequest(new Request("http://127.0.0.1/v1/responses", {
+    method: "POST", body: JSON.stringify({ ...original, input }),
+  }), config, () => ({ name: "restored-delegated-task", async runTurn(parsed, _incoming, emit) {
+    starts += 1;
+    expect(extractChatGptTurnUserRevision(parsed)).toBe(delegation.output);
+    emit({ type: "text_delta", text: "Delegated task continued", phase: "final_answer" });
+    emit({ type: "done", stopReason: "stop", endTurn: true });
+  } }));
+  const continued = await send(installed);
+  expect(continued.status).toBe(200);
+  expect((await continued.json()).status).toBe("completed");
+  // Recovery of a different task never revives an explicitly interrupted delegation.
+  expect((await send([...installed, { ...aborted, id: "msg_delegation_abort",
+    internal_chat_message_metadata_passthrough: delegation.internal_chat_message_metadata_passthrough }])).status).toBe(400);
+  expect(starts).toBe(1);
+});
+
 test("v1 goal compaction authorizes the human instruction that native Codex retains", async () => {
   const config = defaultConfig("full");
   const metadata = { thread_id: "thread_goal_compaction", turn_id: "turn_goal_continuation" };
