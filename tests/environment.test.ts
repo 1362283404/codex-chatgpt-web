@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve, toNamespacedPath } from "node:path";
-import { chatGptTurnUserRevisionHistory, extractChatGptCompactionSourceRevision, extractChatGptTurnEnvironment, extractChatGptTurnIdentity, extractChatGptTurnUserRevision } from "../src/adapters/chatgpt-web/environment";
+import { chatGptTurnUserRevisionHistory, extractChatGptCompactionSourceRevision, extractChatGptTurnEnvironment, extractChatGptTurnIdentity, extractChatGptTurnUserRevision, isChatGptCompactionContinuation } from "../src/adapters/chatgpt-web/environment";
 import { chatGptTurnExecutionKey } from "../src/adapters/chatgpt-web/turn-execution";
 import { rememberCompactionContinuation } from "../src/adapters/chatgpt-web/compaction-continuation";
 import { encodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
@@ -238,6 +238,78 @@ describe("trusted current Codex environment envelope", () => {
     ];
     expect(extractChatGptTurnUserRevision(continuation)).toBe(output);
     expect(extractChatGptTurnEnvironment(continuation).cwd).toBe(root);
+  });
+
+  test.each(["v1", "v2"])("%s compaction recovers a dropped delegation ahead of retained older instructions", format => {
+    const request = currentWire({ threadId: `thread_retained_delegation_${format}` });
+    const body = request._rawBody as { input: Array<Record<string, unknown>> };
+    const context = body.input[0]!;
+    context.internal_chat_message_metadata_passthrough = { turn_id: "turn_current" };
+    const previous: Record<string, unknown> = { ...body.input[1]!, internal_chat_message_metadata_passthrough: { turn_id: "turn_previous" } };
+    const output = "<codex_delegation><source_thread_id>source_thread</source_thread_id><input>Finish the delegated check.</input></codex_delegation>";
+    const source = { content: output, itemId: "fco_current_delegation", turnId: "turn_current" };
+    body.input = [previous, context, {
+      type: "function_call_output", id: source.itemId, name: "send_message_to_thread", namespace: "codex_app",
+      output, internal_chat_message_metadata_passthrough: { turn_id: source.turnId },
+    }];
+    const originalKey = chatGptTurnExecutionKey(request);
+    const summary = `Completed delegated checkpoint (${format})`;
+    // The v1 producer also authenticates the retained human-message representation.
+    rememberCompactionContinuation({ ...request, _compactionRequest: true }, extractChatGptTurnIdentity(request), [
+      source, { content: previous.content, turnId: "turn_previous", itemId: String(previous.id) },
+    ], summary);
+    const checkpoint = format === "v1"
+      ? { type: "message", role: "user", content: [{ type: "input_text", text: `${SUMMARY_PREFIX}\n${summary}` }] }
+      : { type: "compaction", encrypted_content: encodeCompactionSummary(summary) };
+    // Native compaction retains the human message but drops the function-call-output instruction.
+    body.input = [context, previous, checkpoint];
+    expect(extractChatGptTurnUserRevision(request)).toBe(output);
+    expect(chatGptTurnUserRevisionHistory(request)).toEqual([source]);
+    expect(chatGptTurnExecutionKey(request)).toBe(originalKey);
+    expect(isChatGptCompactionContinuation(request)).toBe(true);
+    // Subsequent tool rounds retain the authenticated instruction too.
+    body.input.push({ type: "function_call", name: "exec_command", call_id: "call_after_checkpoint", arguments: "{}" });
+    expect(chatGptTurnExecutionKey(request)).toBe(originalKey);
+
+    // An exact checkpoint must never mask a later conflicting native instruction.
+    body.input.push({ ...previous, id: "msg_wrong_turn_after_checkpoint", content: "A different turn's unrelated instruction" });
+    expect(() => extractChatGptTurnUserRevision(request)).toThrow("conflicts with native Codex turn_id");
+    body.input.pop();
+    const steering = { ...previous, id: "msg_current_steering", content: "Use the revised experiment",
+      internal_chat_message_metadata_passthrough: { turn_id: "turn_current" } };
+    body.input.push(steering);
+    expect(extractChatGptTurnUserRevision(request)).toBe(steering.content);
+    expect(chatGptTurnUserRevisionHistory(request)).toEqual([source, {
+      content: steering.content, itemId: steering.id, turnId: "turn_current",
+    }]);
+    expect(chatGptTurnExecutionKey(request)).not.toBe(originalKey);
+    body.input.pop();
+
+    const rewritten = structuredClone(request);
+    (rewritten._rawBody as typeof body).input[1]!.content = "Rewritten retained task";
+    expect(() => extractChatGptTurnUserRevision(rewritten)).toThrow("conflicts with native Codex turn_id");
+    for (const mutation of [
+      { ...checkpoint, internal_chat_message_metadata_passthrough: { turn_id: "other_turn" } },
+      format === "v1"
+        ? { ...checkpoint, content: [{ type: "input_text", text: `${SUMMARY_PREFIX}\nNever returned by this daemon` }] }
+        : { ...checkpoint, encrypted_content: encodeCompactionSummary("Never returned by this daemon") },
+    ]) {
+      const invalid = structuredClone(request);
+      (invalid._rawBody as typeof body).input[2] = mutation;
+      expect(() => extractChatGptTurnUserRevision(invalid)).toThrow("conflicts with native Codex turn_id");
+    }
+    for (const field of ["thread_id", "turn_id"]) {
+      const invalid = structuredClone(request);
+      const raw = invalid._rawBody as { client_metadata: Record<string, string> };
+      const metadata = JSON.parse(raw.client_metadata["x-codex-turn-metadata"]!);
+      metadata[field] = "unrelated_scope";
+      raw.client_metadata["x-codex-turn-metadata"] = JSON.stringify(metadata);
+      expect(() => extractChatGptTurnUserRevision(invalid)).toThrow("conflicts with native Codex turn_id");
+    }
+    for (const invalid of [
+      { ...request, modelId: "different_model" },
+      { ...request, options: { ...request.options, reasoning: "xhigh" as const } },
+    ]) expect(() => extractChatGptTurnUserRevision(invalid)).toThrow("conflicts with native Codex turn_id");
   });
 
   test("only the native delegated message shape can become a cross-task instruction", () => {
@@ -1567,6 +1639,38 @@ describe("trusted Codex task environment continuity", () => {
     ].join("\n") + "\n");
     // A valid cached environment and matching wire claim cannot overrule a different native turn.
     expect(() => store.resolve(request)).toThrow("current turn");
+  });
+
+  test.each(["v1", "v2"])("%s recovered delegation still requires current rollout environment proof", format => {
+    const { codexHome, request, rolloutPath } = resumedRootFixture();
+    const body = request._rawBody as { input: Array<Record<string, unknown>> };
+    const previous = body.input[0]!;
+    previous.internal_chat_message_metadata_passthrough = { turn_id: "turn_old_human" };
+    const output = "<codex_delegation><source_thread_id>source_thread</source_thread_id><input>Continue the requested audit.</input></codex_delegation>";
+    const source = { content: output, itemId: "fco_environment_delegation", turnId: rolloutTurnId };
+    body.input.push({ type: "function_call_output", id: source.itemId, name: "send_message_to_thread", namespace: "codex_app",
+      output, internal_chat_message_metadata_passthrough: { turn_id: rolloutTurnId } });
+    const summary = `Delegation environment checkpoint ${format}`;
+    rememberCompactionContinuation({ ...request, _compactionRequest: true }, extractChatGptTurnIdentity(request), [
+      source, { content: previous.content, itemId: String(previous.id), turnId: "turn_old_human" },
+    ], summary);
+    const environmentPart = { type: "input_text", text: environmentXml };
+    body.input = [
+      { type: "message", role: "user", id: "msg_current_context", content: [environmentPart],
+        internal_chat_message_metadata_passthrough: { turn_id: rolloutTurnId } },
+      previous,
+      format === "v1"
+        ? { type: "message", role: "user", content: [{ type: "input_text", text: `${SUMMARY_PREFIX}\n${summary}` }] }
+        : { type: "compaction", encrypted_content: encodeCompactionSummary(summary) },
+    ];
+    expect(extractChatGptTurnUserRevision(request)).toBe(output);
+    const store = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome);
+    expect(store.resolve(request).cwd).toBe(root);
+    environmentPart.text = environmentXml.replaceAll(root, resolve(root, "unproven-workspace"));
+    expect(() => store.resolve(request)).toThrow();
+    environmentPart.text = environmentXml;
+    rmSync(rolloutPath);
+    expect(() => store.resolve(request)).toThrow("missing cwd");
   });
 
   test("compaction keeps current native output-directory grants omitted from workspace roots", () => {
