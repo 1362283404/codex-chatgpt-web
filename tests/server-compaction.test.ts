@@ -12,10 +12,11 @@ const model = "chatgpt-web/high";
 const summary = "The repository was inspected. Continue by implementing the bounded Web context contract.";
 
 for (const format of ["memento", "v2"] as const) {
-  for (const stream of [false, true]) test(`${format} compaction completes for a native child with no human messages (stream=${stream})`, async () => {
+  for (const nativeContext of [false, true]) {
+  for (const stream of [false, true]) test(`${format} compaction completes for a native child with no human messages (stream=${stream}, nativeContext=${nativeContext})`, async () => {
     const metadata = {
       request_kind: format === "memento" ? "compaction" : "turn",
-      thread_id: `thread_agent_only_${format}_${stream}`, turn_id: "turn_agent_only",
+      thread_id: `thread_agent_only_${format}_${stream}_${nativeContext}`, turn_id: "turn_agent_only",
       parent_thread_id: "thread_parent", agent_name: "/root/independent_reviewer", subagent_kind: "thread_spawn",
       ...(format === "memento" ? { compaction: { trigger: "auto", reason: "context_limit",
         implementation: "responses", phase: "pre_turn", strategy: "memento" } } : {}),
@@ -23,8 +24,15 @@ for (const format of ["memento", "v2"] as const) {
     const source = { type: "agent_message", id: "amsg_parent_instruction", author: "/root",
       recipient: "/root/independent_reviewer", content: [{ type: "input_text", text: "Finish the independent audit." }],
       internal_chat_message_metadata_passthrough: { turn_id: "turn_agent_only" } };
+    // Observed native children combine AGENTS and environment in a contextual user item.
+    // It is not a human instruction, even if the v1 producer includes that item in its output.
+    const context = { type: "message", id: "msg_native_context", role: "user", content: [
+      { type: "input_text", text: "# AGENTS.md instructions\n<INSTRUCTIONS>Verify actual outcomes.</INSTRUCTIONS>" },
+      { type: "input_text", text: "<environment_context><cwd>/workspace</cwd></environment_context>" },
+    ], internal_chat_message_metadata_passthrough: { turn_id: "turn_agent_only",
+      content_item_kinds: ["agents_md.instructions", "environments.environment_context"] } };
     const body = { model, stream, client_metadata: { "x-codex-turn-metadata": JSON.stringify(metadata) },
-      input: [source, ...(format === "v2" ? [{ type: "compaction_trigger" }] : [])] };
+      input: [...(nativeContext ? [context] : []), source, ...(format === "v2" ? [{ type: "compaction_trigger" }] : [])] };
     const response = await responseRequest(new Request("http://127.0.0.1/v1/responses", {
       method: "POST", body: JSON.stringify(body),
     }), defaultConfig("full"), compactionAdapterFactory());
@@ -58,6 +66,7 @@ for (const format of ["memento", "v2"] as const) {
     } };
     expect(() => extractChatGptTurnUserRevision(otherThread)).toThrow("requires a current-turn user message");
   });
+  }
 }
 
 test("native responses/memento compaction returns assistant text, not an encrypted compaction item", async () => {

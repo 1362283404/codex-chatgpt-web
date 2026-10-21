@@ -337,10 +337,18 @@ export function extractChatGptCompactionSourceRevision(
   parsed: CodexParsedRequest,
   options: { recoverCheckpoint?: boolean } = {},
 ): ChatGptTurnUserRevision {
-  if (!parsed._compactionRequest) throw new Error("ChatGPT web compaction source requires a compaction request");
-  const revision = latestChatGptTurnUserRevision(parsed, extractChatGptTurnIdentity(parsed).turnId, options.recoverCheckpoint !== false);
+  const revision = findChatGptCompactionSourceRevision(parsed, options);
   if (!revision) throw new Error("ChatGPT web compaction requires a source user message");
   return revision;
+}
+
+/** A retained representation can have context but no instruction; it adds no source alias. */
+export function findChatGptCompactionSourceRevision(
+  parsed: CodexParsedRequest,
+  options: { recoverCheckpoint?: boolean } = {},
+): ChatGptTurnUserRevision | undefined {
+  if (!parsed._compactionRequest) throw new Error("ChatGPT web compaction source requires a compaction request");
+  return latestChatGptTurnUserRevision(parsed, extractChatGptTurnIdentity(parsed).turnId, options.recoverCheckpoint !== false);
 }
 
 /** A completed checkpoint identifies the current turn's rebuilt environment preamble. */
