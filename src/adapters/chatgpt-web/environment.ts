@@ -404,6 +404,9 @@ export function extractChatGptContinuationEnvironmentClaim(parsed: CodexParsedRe
   // fragment must pass the existing strict calendar parser, and the store must
   // still compare its roots/profile with the exact current native rollout.
   const first = updates[0];
+  if (first && updates.some((update, index) => index > 0 && update.index === first.index)) {
+    throw new Error("Compaction continuation requires one current native environment claim");
+  }
   const calendarDelta = first && extractChatGptCalendarEnvironmentDelta(parsed, { afterEnvironmentIndex: first.index });
   if (!first || !calendarDelta) throw new Error("Compaction continuation requires one current native environment claim");
   return { ...environmentClaim(parsed, first.text), calendarDelta };

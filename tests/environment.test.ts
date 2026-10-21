@@ -1925,6 +1925,14 @@ describe("trusted Codex task environment continuity", () => {
       : { type: "compaction", encrypted_content: encodeCompactionSummary(summary) }, delta];
     const store = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome);
     expect(store.resolve(request).cwd).toBe(root);
+    // A second claim in the rebuilt base message must not be skipped by the
+    // calendar scan, which starts after that entire message (#884 review).
+    for (const text of [environmentXml.replaceAll(root, resolve(root, "conflicting-cwd")), environmentXml]) {
+      current.content.push({ type: "input_text", text });
+      expect(() => store.resolve(request)).toThrow();
+      current.content.pop();
+    }
+    expect(store.resolve(request).cwd).toBe(root);
     const valid = delta.content[0]!.text;
     for (const malformed of [
       valid.replaceAll(root, resolve(root, "ungranted")),
