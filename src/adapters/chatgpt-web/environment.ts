@@ -357,6 +357,11 @@ export function isChatGptCompactionContinuation(parsed: CodexParsedRequest): boo
       : isAcceptedCompactionContinuation(parsed, identity, revision));
 }
 
+export interface ChatGptCalendarEnvironmentDelta {
+  workspaceRoots: string[][];
+  filesystemProfiles: string[];
+}
+
 export interface ChatGptEnvironmentClaim {
   environment: ChatGptTurnEnvironment;
   /**
@@ -364,6 +369,8 @@ export interface ChatGptEnvironmentClaim {
    * in the native turn context. Only the legacy sandbox_mode envelope carried a network statement.
    */
   statesNetworkAccess: boolean;
+  /** Later calendar fragments remain claims until the current rollout corroborates them. */
+  calendarDelta?: ChatGptCalendarEnvironmentDelta;
 }
 
 function environmentClaim(parsed: CodexParsedRequest, text: string): ChatGptEnvironmentClaim {
@@ -377,7 +384,7 @@ function environmentClaim(parsed: CodexParsedRequest, text: string): ChatGptEnvi
 export function extractChatGptContinuationEnvironmentClaim(parsed: CodexParsedRequest): ChatGptEnvironmentClaim {
   const turnId = extractChatGptTurnIdentity(parsed).turnId;
   const body = record(parsed._rawBody);
-  const updates = (Array.isArray(body?.input) ? body.input : []).flatMap(value => {
+  const updates = (Array.isArray(body?.input) ? body.input : []).flatMap((value, index) => {
     const item = record(value);
     if (item?.type !== "message" || item.role !== "user" || itemTurnId(item) !== turnId
       || typeof item.id !== "string" || !item.id) return [];
@@ -388,11 +395,21 @@ export function extractChatGptContinuationEnvironmentClaim(parsed: CodexParsedRe
     return parts.flatMap(value => {
       if (typeof value !== "string") return [];
       const text = value.trim();
-      return /^<environment_context>[\s\S]*<\/environment_context>$/.test(text) ? [text] : [];
+      return /^<environment_context>[\s\S]*<\/environment_context>$/.test(text) ? [{ text, index }] : [];
     });
   });
-  if (updates.length !== 1) throw new Error("Compaction continuation requires one current native environment claim");
-  return environmentClaim(parsed, updates[0]!);
+  if (updates.length === 1) return environmentClaim(parsed, updates[0]!.text);
+  // A rebuilt full preamble followed by midnight's date-only fragment is one
+  // environment plus a delta, not two competing complete grants. Every later
+  // fragment must pass the existing strict calendar parser, and the store must
+  // still compare its roots/profile with the exact current native rollout.
+  const first = updates[0];
+  if (first && updates.some((update, index) => index > 0 && update.index === first.index)) {
+    throw new Error("Compaction continuation requires one current native environment claim");
+  }
+  const calendarDelta = first && extractChatGptCalendarEnvironmentDelta(parsed, { afterEnvironmentIndex: first.index });
+  if (!first || !calendarDelta) throw new Error("Compaction continuation requires one current native environment claim");
+  return { ...environmentClaim(parsed, first.text), calendarDelta };
 }
 
 /**
@@ -477,18 +494,24 @@ export function extractChatGptSteeringEnvironmentClaim(parsed: CodexParsedReques
  * still requires this exact turn's native rollout and corroborating current sandbox metadata.
  * Unknown profiles/fields are deliberately not classified as permission-neutral updates.
  */
-export function extractChatGptCalendarEnvironmentDelta(parsed: CodexParsedRequest): {
-  workspaceRoots: string[][];
-  filesystemProfiles: string[];
-} | undefined {
+export function extractChatGptCalendarEnvironmentDelta(
+  parsed: CodexParsedRequest,
+  options?: { afterEnvironmentIndex: number },
+): ChatGptCalendarEnvironmentDelta | undefined {
   const metadata = clientTurnMetadata(parsed);
   const turnId = extractChatGptTurnIdentity(parsed).turnId;
   if (!metadata || !turnId) return undefined;
   const body = record(parsed._rawBody);
   const input = Array.isArray(body?.input) ? body.input : [];
-  const activeIndex = input.findLastIndex(value => isNativeInstruction(record(value), metadata));
+  const activeIndex = options?.afterEnvironmentIndex
+    ?? input.findLastIndex(value => isNativeInstruction(record(value), metadata));
   const active = record(input[activeIndex]);
   if (itemTurnId(active) !== turnId || typeof active?.id !== "string" || !active.id) return undefined;
+  if (options) {
+    const kinds = record(active.internal_chat_message_metadata_passthrough)?.content_item_kinds;
+    if (active.type !== "message" || active.role !== "user" || !Array.isArray(kinds)
+      || !kinds.includes("environments.environment_context")) return undefined;
+  }
 
   let deltas = 0;
   const workspaceRoots: string[][] = [];
