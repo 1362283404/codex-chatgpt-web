@@ -9,7 +9,7 @@ interface CompletedCheckpoint {
   summaryHash: string;
   sourceHashes: ReadonlySet<string>;
   source: ChatGptTurnUserRevision;
-  sourceWasDelegation: boolean;
+  sourceWasSyntheticInstruction: boolean;
   taskMessage?: CodexMessage;
   taskItemId?: string;
 }
@@ -68,21 +68,21 @@ export function rememberCompactionContinuation(
       ? priorCheckpoint.taskMessage : undefined;
   const taskItemId = sourceItem && (nativeGoal || readNativeThreadDelegation(sourceItem))
     ? String(sourceItem.id) : taskMessage ? priorCheckpoint?.taskItemId : undefined;
-  // Source extraction has already authenticated this synthetic native instruction. Unlike
-  // human messages, function-call outputs are not retained by the v1 compaction producer.
-  const sourceWasDelegation = sources[0].itemId !== undefined && Array.isArray(input)
+  // Source extraction has already authenticated this synthetic native instruction. Native
+  // compaction drops goal context and delegation outputs while retaining older human messages.
+  const sourceWasSyntheticInstruction = nativeGoal || sources[0].itemId !== undefined && Array.isArray(input)
     && input.some(item => item?.id === sources[0]!.itemId && item.type === "function_call_output"
       && item.name === "send_message_to_thread" && item.namespace === "codex_app" && item.call_id === undefined
       && item.output === sources[0]!.content)
     // Later compactions no longer contain the synthetic item. Carry its provenance only
     // through an exact earlier completed checkpoint, never a newer steering instruction.
-    || previous?.sourceWasDelegation === true && previous.source.itemId === sources[0].itemId
+    || previous?.sourceWasSyntheticInstruction === true && previous.source.itemId === sources[0].itemId
       && sourceDigest(previous.source) === sourceDigest(sources[0]);
   checkpoints.delete(key);
   checkpoints.set(key, {
     summaryHash: digest(summary), sourceHashes: new Set(sources.map(sourceDigest)),
     source: structuredClone(sources[0]),
-    sourceWasDelegation,
+    sourceWasSyntheticInstruction,
     ...(taskMessage ? { taskMessage: structuredClone(taskMessage), taskItemId } : {}),
   });
   while (checkpoints.size > MAX_CHECKPOINTS) checkpoints.delete(checkpoints.keys().next().value!);
@@ -126,11 +126,11 @@ export function isAcceptedCompactionContinuation(
 export function recoverCompactionInstruction(
   parsed: CodexParsedRequest,
   identity: ChatGptTurnIdentity,
-): { source: ChatGptTurnUserRevision; summaryIndex: number; sourceWasDelegation: boolean } | undefined {
+): { source: ChatGptTurnUserRevision; summaryIndex: number; sourceWasSyntheticInstruction: boolean } | undefined {
   const accepted = acceptedCheckpoint(parsed, identity);
   return accepted ? {
     source: structuredClone(accepted.checkpoint.source), summaryIndex: accepted.summaryIndex,
-    sourceWasDelegation: accepted.checkpoint.sourceWasDelegation,
+    sourceWasSyntheticInstruction: accepted.checkpoint.sourceWasSyntheticInstruction,
   } : undefined;
 }
 

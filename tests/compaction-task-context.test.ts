@@ -3,7 +3,7 @@ import { defaultConfig } from "../src/config";
 import { compactRequest, responseRequest } from "../src/server";
 import { compileChatGptWebPrompt } from "../src/adapters/chatgpt-web/prompt";
 import { rememberCompactionContinuation, restoreCompactionTaskMessages } from "../src/adapters/chatgpt-web/compaction-continuation";
-import { chatGptTurnUserRevisionHistory, extractChatGptTurnIdentity } from "../src/adapters/chatgpt-web/environment";
+import { chatGptTurnUserRevisionHistory, extractChatGptCompactionSourceRevision, extractChatGptTurnIdentity } from "../src/adapters/chatgpt-web/environment";
 import { parseRequest } from "../src/responses/parser";
 import { encodeCompactionSummary } from "../src/responses/compaction";
 
@@ -97,8 +97,10 @@ test("task restoration preserves repeated authenticated checkpoints and rejects 
     restoreCompactionTaskMessages(parsed, scope, chatGptTurnUserRevisionHistory(parsed));
   expect(restore(replay).filter(m => m.content === task.content)).toHaveLength(1);
   replay._compactionRequest = true;
-  // A later native goal compaction extracts its retained human source; preserve the saved task.
-  rememberCompactionContinuation(replay, identity, [retained, retained], "Second exact summary");
+  // Recompaction keeps the authenticated goal as the source despite its missing raw item.
+  const recoveredSource = extractChatGptCompactionSourceRevision(replay);
+  expect(recoveredSource).toEqual(source);
+  rememberCompactionContinuation(replay, identity, [recoveredSource, retained], "Second exact summary");
   const second = { type: "compaction", encrypted_content: encodeCompactionSummary("Second exact summary") };
   const continuation = parseRequest({ ...body, input: [human, second] });
   expect(restore(continuation).filter(m => m.content === task.content)).toHaveLength(1);
